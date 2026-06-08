@@ -290,7 +290,7 @@ def agent_loop(messages: list):
 
 # Entry point
 if __name__ == "__main__":
-    print("s02: Permission")
+    print("s03: Permission")
     print("输入问题, 回车发送. 输入 q 推出. \n")
 
     history = []

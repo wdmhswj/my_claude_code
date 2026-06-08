@@ -1,54 +1,34 @@
 """
-s04: Hooks — move extension logic out of the loop, onto hooks.
+s04: TodoWrite - 在 s04 钩子的基础上添加 计划功能
 
-  User types query
-       │
-       ▼
-  ┌──────────────────┐
-  │ UserPromptSubmit │ ── trigger_hooks() before LLM
-  └────────┬─────────┘
-           ▼
-  ┌────────────┐     ┌─────────────────────────────┐
-  │  messages  │────▶│  LLM (stop_reason=tool_use?)│
-  └────────────┘     │   No ──▶ Stop hooks ──▶ exit │
-                     │   Yes ──▶ tool_use block ──┐ │
-                     └────────────────────────────┘ │
-                                                    ▼
-                                          ┌──────────────────┐
-                                          │ trigger_hooks()   │
-                                          │  PreToolUse:      │
-                                          │   permission_hook │
-                                          │   log_hook        │
-                                          └───────┬──────────┘
-                                                  │ (not blocked)
-                                          ┌───────▼──────────┐
-                                          │ TOOL_HANDLERS[x]  │
-                                          └───────┬──────────┘
-                                                  │
-                                          ┌───────▼──────────┐
-                                          │ trigger_hooks()   │
-                                          │  PostToolUse:     │
-                                          │   large_output    │
-                                          └───────┬──────────┘
-                                                  │
-                                          results ──▶ back to messages
++-------------+     +-----+     +-------------------+
+| User Prompt | --> | LLM | --> | TOOL_HANDLERS     | 
++-------------+     +--+--+     |  bash             |
+                       ^        |  read_file        |
+                       | result |  write_file       |
+                       +--------+  edit_file        |
+                                |  glob             |
+                                |  todo_write <- NEW|
+                                +-------------------+
+                                     |
+                                in-memory current_todos
+                                     |
+                                if rounds_since_todos >= 3:
+                                    inject <reminder>
+  
 
-Changes from s03:
-  + HOOKS registry (event -> list of callbacks)
-  + register_hook() / trigger_hooks()
-  + context_inject_hook (UserPromptSubmit)
-  + permission_hook, log_hook (PreToolUse)
-  + large_output_hook (PostToolUse)
-  + summary_hook (Stop)
-  - check_permission() removed from loop body
-    (logic moved into permission_hook, triggered via PreToolUse)
+Changes from s04:
+  + todo_write 工具 + run_todo_write() 实现
+  + Nag reminder (在3轮没有todo更新后注入reminder提醒)
+  + SYSTEM prompt 中添加 "plan before execute"
+  + 在 agent_loop 中添加 rounds_since_todo 计数器
 
-Run: python s04_hooks/code.py
+  使用 TOOL_HANDLERS 进行自动分发的机制未改变
 
+Run: python s05_todo_write/code.py
 """                                             
 
-import os
-import subprocess
+import ast, os, json, subprocess
 from pathlib import Path
 
 try:
@@ -70,13 +50,19 @@ load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None) # 关闭官方认证方式
 
-# 工作目录
-WORKDIR = Path.cwd()
-# 客户端
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.getenv("MODEL_ID")
 
-SYSTEM = f"You are a code agent at {WORKDIR}. Use tools to solve tasks. Act, do not explain."
+WORKDIR = Path.cwd() # 工作目录
+client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL")) # 客户端
+MODEL = os.getenv("MODEL_ID") # 模型ID
+CURRENT_TODOS: list[dict] = [] # todos
+
+# s05 change: SYSTEM prompt 中添加 planning
+# SYSTEM = f"You are a code agent at {WORKDIR}. Use tools to solve tasks. Act, do not explain."
+SYSTEM = (
+    f"You are a coding agent at {WORKDIR}. "
+    "Before starting ang multi-step task, use todo_write to plan your steps. "
+    "Update status as you go."
+)
 
 
 # 工具执行函数
@@ -151,6 +137,43 @@ def run_glob(pattern: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+# =======================================================
+# s05: todo_write tool - 只plan, 不执行
+# =======================================================
+
+def _normalize_todos(todos):
+    if isinstance(todos, str):
+        try:
+            todos = json.loads(todos)
+        except json.JSONDecodeError:
+            try:
+                todos = ast.literal_eval(todos)
+            except (SyntaxError, ValueError):
+                return None, "Error: todos must be a list or JSON array string"
+    if not isinstance(todos, list):
+        return None, "Error: todos must be a list"
+    for i, t in enumerate(todos):
+        if not isinstance(t, dict):
+            return None, f"Error: todos[{i}] must be an object"
+        if "content" not in t or "status" not in t:
+            return None, f"Error: todos[{i}] missing 'content' or 'status'"
+        if t["status"] not in ("pending", "in_progress", "completed"):
+            return None, f"Error: todos[{i}] has invalid status '{t['status']}'"
+    return todos, None
+
+def run_todo_write(todos: list) -> str:
+    global CURRENT_TODOS
+    todos, error = _normalize_todos(todos)
+    if error:
+        return error
+    CURRENT_TODOS = todos
+    lines = ["\n## Current Tasks"]
+    for t in CURRENT_TODOS:
+        icon = {"pending": " ", "in_progress": "▸", "completed": "✓"}[t["status"]]
+        lines.append(f"  [{icon}] {t['content']}")
+    print("\n".join(lines))
+    return f"Updated {len(CURRENT_TODOS)} tasks"
+
 
 # =======================================================
 # s02: 工具定义扩展到 5 个
@@ -202,6 +225,26 @@ TOOLS = [
             "required": ["pattern"],
         },
     },
+    # s05: new tool
+    {
+        "name": "todo_write", 
+        "description": "Create and manage a task list for your current coding session.",
+        "input_schema": {
+            "type": "object", 
+            "properties": {
+                "todos": {
+                    "type": "array", 
+                    "items": {
+                        "type": "object", 
+                        "properties": {
+                            "content": {"type": "string"}, 
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}
+                        }, 
+                                                                        "required": ["content", "status"]
+                                                                    }}}, 
+            "required": ["todos"]
+        }
+    },
 ]
 
 # =======================================================
@@ -214,6 +257,7 @@ TOOL_HANDLERS = {
     "write_file": run_write,
     "edit_file": run_edit,
     "glob": run_glob,
+    "todo_write": run_todo_write,
 }
 
 # =======================================================
@@ -368,9 +412,18 @@ register_hook("Stop", summary_hook)
 # s02: output = TOOL_HANDLERS[block.name](**block.input)
 # =======================================================
 
+
+rounds_since_todo = 0
+
 # 核心 pattern: 一个 while 循环调用工具执行直到模型发送停止命令
 def agent_loop(messages: list):
+    global rounds_since_todo
     while True:
+        # s05: nag reminder
+        if rounds_since_todo >= 3 and messages:
+            messages.append({"role": "user", "content": "<reminder>Update your todos.</reminder>"})
+            rounds_since_todo = 0
+
         # 客户端通过API发起请求并接收响应
         resp = client.messages.create(model=MODEL, system=SYSTEM, messages=messages, tools=TOOLS, max_tokens=8000)
 
@@ -385,7 +438,9 @@ def agent_loop(messages: list):
                 continue
             return
         
+
         # 执行工具
+        rounds_since_todo += 1
         results = []
         for block in resp.content:
             if block.type != "tool_use":
@@ -414,6 +469,11 @@ def agent_loop(messages: list):
             output = handler(**block.input) if handler else f"Unknown: {block.name}"
             # print(output[:200])
             trigger_hooks("PostToolUse", block, output)
+            
+            # s05: 当todo_write被调用时重置nag counter
+            if block.name == "todo_write":
+                rounds_since_todo = 0
+
             results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
@@ -425,7 +485,7 @@ def agent_loop(messages: list):
 
 # Entry point
 if __name__ == "__main__":
-    print("s04: Hooks")
+    print("s02: TODO WRITE")
     print("输入问题, 回车发送. 输入 q 推出. \n")
 
     history = []
