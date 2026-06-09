@@ -1,31 +1,31 @@
 """
-s05: TodoWrite - 在 s04 钩子的基础上添加 计划功能
+s06: Subagent - 下发 messages[] 消息列表为空的 sub-agents 实现 context 隔离 
 
-+-------------+     +-----+     +-------------------+
-| User Prompt | --> | LLM | --> | TOOL_HANDLERS     | 
-+-------------+     +--+--+     |  bash             |
-                       ^        |  read_file        |
-                       | result |  write_file       |
-                       +--------+  edit_file        |
-                                |  glob             |
-                                |  todo_write <- NEW|
-                                +-------------------+
-                                     |
-                                in-memory current_todos
-                                     |
-                                if rounds_since_todos >= 3:
-                                    inject <reminder>
+  Parent Agent                           Subagent
+  +------------------+                  +------------------+
+  | messages=[...]   |                  | messages=[task]  | <-- fresh
+  |                  |   dispatch       |                  |
+  | tool: task       | ---------------> | own while loop   |
+  |   prompt="..."   |                  |   bash/read/...  |
+  |                  |   summary only   |   (max 30 turns) |
+  | result = "..."   | <--------------- | return last text |
+  +------------------+                  +------------------+
+        ^                                      |
+        |       intermediate results DISCARDED  |
+        +--------------------------------------+
+
+  Subagent tools: bash, read, write, edit, glob (NO task — no recursion)
+
+
   
 
-Changes from s04:
-  + todo_write 工具 + run_todo_write() 实现
-  + Nag reminder (在3轮没有todo更新后注入reminder提醒)
-  + SYSTEM prompt 中添加 "plan before execute"
-  + 在 agent_loop 中添加 rounds_since_todo 计数器
+Changes from s05:
+  + task 工具 + spwan_subagent() with fresh messages[]
+  + 安全限制: max 30 turns per subagent 
+  + extract_text() 辅助函数
+  Subagent 不能递归的派发 sub-subagents (通过将 task tool 排除在 sub_tools 外实现)
 
-  使用 TOOL_HANDLERS 进行自动分发的机制未改变
-
-Run: python s05_todo_write/code.py
+Run: python s06_subagent/code.py
 """                                             
 
 import ast, os, json, subprocess
@@ -64,6 +64,13 @@ SYSTEM = (
     "Update status as you go."
 )
 
+# s06: subagent 拥有它自己的 system prompt - 没有 task 工具, 没有无限递归循环
+SUB_SYSTEM = (
+    f"You are a coding agent at {WORKDIR}. "
+    "Complete the task you were given, then return a concise summary. "
+    "Do not delegate further."
+
+)
 
 # 工具执行函数
 def run_bash(command: str) -> str:
@@ -259,6 +266,71 @@ TOOL_HANDLERS = {
     "glob": run_glob,
     "todo_write": run_todo_write,
 }
+
+# =======================================================
+# s06: 增加 Subagent - fresh messsages[], summary only
+# =======================================================
+
+SUB_TOOLS = [
+    {
+        "name": "bash",
+        "description": "Run a shell command.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "read_file",
+        "description": "Read file contents.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}},
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "write_file",
+        "description": "Write content to a file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "edit_file",
+        "description": "Replace exact text in a file once.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}},
+            "required": ["path", "old_text", "new_text"],
+        },
+    },
+    {
+        "name": "glob",
+        "description": "Find files matching a glob pattern.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"pattern": {"type": "string"}},
+            "required": ["pattern"],
+        },
+    },
+]
+# NO "task" tool — prevent recursive spawning
+# No "todo_write" tool - 子任务暂时不需要计划列表
+
+SUB_HANDLERS = {
+    "bash": run_bash, "read_file": run_read, "write_file": run_write,
+    "edit_file": run_edit, "glob": run_glob,
+}
+
+def extract_text(content) -> str:
+    """从 message content blocks 中提取文本"""
+    if not isinstance(content, list):
+        return str(content)
+    return "\n".join(getattr(b, "text", "") for b in content if getattr(b, "type", None) == "text")
 
 # =======================================================
 # s04: 增加 钩子回调系统 (s03 中的权限管理通过回调实现)
