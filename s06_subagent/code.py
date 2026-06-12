@@ -332,6 +332,53 @@ def extract_text(content) -> str:
         return str(content)
     return "\n".join(getattr(b, "text", "") for b in content if getattr(b, "type", None) == "text")
 
+def spawn_subagent(description: str) -> str:
+    """Spawn a subagent with fresh messages[], return summary only."""
+    print(f"\n[Subagent spawned]")
+    messages = [{"role": "user", "content": description}]
+
+    for _ in range(30):
+        resp = client.messages.create(model=MODEL, system=SUB_SYSTEM, messages=messages, tools=SUB_TOOLS, max_tokens=8000)
+
+        messages.append({"role": "assistant", "content": resp.content})
+        if resp.stop_reason != "tool_use":
+            break
+        results = []
+        for block in resp.content:
+            if block.type == "tool_use":
+                blocked = trigger_hooks("PreToolUse", block)
+                if blocked:
+                    messages.append({"type": "tool_result", "tool_use_id": block.id, "content": str(blocked)})
+                    continue
+                handler = SUB_HANDLERS.get(block.name)
+                output = handler(**block.input) if handler else f"Unknown: {block.name}"
+                trigger_hooks("PostToolUse", block, output)
+                print(f"    [sub] {block.name}: {str(output)[:100]}")
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+        
+        messages.append({"role": "user", "content": results})
+
+    # 提取subagent运行的最后结果
+    result = extract_text(messages[-1]["content"])
+    if not result:
+        for message in reversed(messages):
+            if message["role"] == "assitant":
+                result = extract_text(message["content"])
+                if result:
+                    break
+        if not result:
+            result = "Subagent stopped after 30 turns without final answer."
+    print(f"[Subagent done]")
+    return result
+
+TOOLS.append({
+    "name": "task",
+    "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
+    "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]},
+})
+TOOL_HANDLERS["task"] = spawn_subagent
+
+
 # =======================================================
 # s04: 增加 钩子回调系统 (s03 中的权限管理通过回调实现)
 # =======================================================
@@ -557,7 +604,7 @@ def agent_loop(messages: list):
 
 # Entry point
 if __name__ == "__main__":
-    print("s02: TODO WRITE")
+    print("s06: TODO WRITE")
     print("输入问题, 回车发送. 输入 q 推出. \n")
 
     history = []
